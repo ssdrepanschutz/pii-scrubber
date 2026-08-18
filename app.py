@@ -4,6 +4,7 @@ import inspect
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -28,8 +29,11 @@ class PIIScrubberApp(tk.Tk):
         self.page_modes = {}
         self.preview_img = None
         self.q = queue.Queue()
+        self.operation_start = None
+        self.operation_active = False
         self._build()
         self.after(100, self._poll)
+        self.after(500, self._tick_elapsed)
 
     def _build(self):
         top = ttk.Frame(self, padding=10); top.pack(fill="x")
@@ -54,13 +58,43 @@ class PIIScrubberApp(tk.Tk):
         self.canvas=tk.Canvas(right,bg="#666666",highlightthickness=0); self.canvas.pack(fill="both",expand=True)
         export=ttk.LabelFrame(self,text="Verified Export",padding=8); export.pack(fill="x",padx=10,pady=(2,6)); self.mode_var=tk.StringVar(value="tokens"); self.raster_var=tk.BooleanVar(value=True); self.search_var=tk.BooleanVar(value=True)
         ttk.Radiobutton(export,text="Replacement tokens",variable=self.mode_var,value="tokens").pack(side="left"); ttk.Radiobutton(export,text="Black redaction",variable=self.mode_var,value="black").pack(side="left",padx=(4,12)); ttk.Checkbutton(export,text="Rasterize only failed pages",variable=self.raster_var).pack(side="left",padx=4); ttk.Checkbutton(export,text="Restore search on rasterized pages",variable=self.search_var).pack(side="left",padx=4); ttk.Button(export,text="Scrub + Verify + Export",command=self.export).pack(side="right")
-        status=ttk.Frame(self,padding=(10,0,10,10)); status.pack(fill="x"); self.progress=ttk.Progressbar(status,mode="determinate"); self.progress.pack(fill="x"); self.status_var=tk.StringVar(value="Ready"); ttk.Label(status,textvariable=self.status_var).pack(anchor="w",pady=(3,0))
+        status=ttk.Frame(self,padding=(10,0,10,10)); status.pack(fill="x")
+        self.progress=ttk.Progressbar(status,mode="determinate",maximum=100); self.progress.pack(fill="x")
+        info=ttk.Frame(status); info.pack(fill="x",pady=(3,0))
+        self.status_var=tk.StringVar(value="Ready")
+        self.progress_var=tk.StringVar(value="0%")
+        self.elapsed_var=tk.StringVar(value="Elapsed: 00:00")
+        ttk.Label(info,textvariable=self.status_var).pack(side="left",anchor="w")
+        ttk.Label(info,textvariable=self.progress_var).pack(side="right",padx=(12,0))
+        ttk.Label(info,textvariable=self.elapsed_var).pack(side="right")
 
     def _fast_mode_changed(self):
         if self.fast_var.get():
             self.chunk_var.set(250)
             self.ocr_var.set(True)
             if hasattr(self, "status_var"): self.status_var.set("Fast OCR-PDF Mode: existing searchable text first; OCR only when needed; 250-page chunks.")
+
+    def _start_operation(self, message):
+        self.operation_start = time.monotonic()
+        self.operation_active = True
+        self.progress["maximum"] = 100
+        self.progress["value"] = 0
+        self.progress_var.set("0%")
+        self.elapsed_var.set("Elapsed: 00:00")
+        self.status_var.set(message)
+        self.update_idletasks()
+
+    def _finish_operation(self):
+        self.operation_active = False
+        if self.operation_start is not None:
+            elapsed = int(time.monotonic() - self.operation_start)
+            self.elapsed_var.set(f"Elapsed: {elapsed // 60:02d}:{elapsed % 60:02d}")
+
+    def _tick_elapsed(self):
+        if self.operation_active and self.operation_start is not None:
+            elapsed = int(time.monotonic() - self.operation_start)
+            self.elapsed_var.set(f"Elapsed: {elapsed // 60:02d}:{elapsed % 60:02d}")
+        self.after(500, self._tick_elapsed)
 
     def _scan_options(self, custom):
         kwargs = dict(
@@ -108,11 +142,10 @@ class PIIScrubberApp(tk.Tk):
             self.input_path=p
             custom=[x.strip() for x in self.custom_var.get().split(";") if x.strip()]
             opts=self._scan_options(custom)
-            self.progress["value"]=0
-            self.status_var.set("Starting scan...")
-            self.update_idletasks()
+            self._start_operation("Starting scan...")
             threading.Thread(target=self._scan_worker,args=(opts,),daemon=True).start()
         except Exception as e:
+            self._finish_operation()
             self.status_var.set("Scan could not start.")
             messagebox.showerror("PII Scrubber - Scan Error",f"The scan could not start.\n\n{type(e).__name__}: {e}")
 
@@ -164,9 +197,10 @@ class PIIScrubberApp(tk.Tk):
                 messagebox.showerror("PII Scrubber","The scrubbed file cannot overwrite the original.")
                 return
             opts=self._export_options()
-            self.status_var.set("Fast scrub + verify..." if self.fast_var.get() else "Scrubbing, sanitizing, and independently verifying...")
+            self._start_operation("Fast scrub + verify..." if self.fast_var.get() else "Scrubbing, sanitizing, and independently verifying...")
             threading.Thread(target=self._export_worker,args=(out,opts),daemon=True).start()
         except Exception as e:
+            self._finish_operation()
             self.status_var.set("Export could not start.")
             messagebox.showerror("PII Scrubber - Export Error",f"The export could not start.\n\n{type(e).__name__}: {e}")
 
@@ -178,14 +212,28 @@ class PIIScrubberApp(tk.Tk):
         try:
             while True:
                 msg=self.q.get_nowait()
-                if msg[0]=="status":self.status_var.set(msg[1])
-                elif msg[0]=="progress":_,stage,current,total=msg;self.progress["maximum"]=max(1,total);self.progress["value"]=current;self.status_var.set(f"{stage.replace('_',' ').title()}: {current}/{total}")
-                elif msg[0]=="scan_done":_,self.findings,self.page_modes=msg;self._refresh_tree();failed_ocr=sum(1 for m in self.page_modes.values() if m=="ocr_failed");self.status_var.set(f"Scan complete: {len(self.findings)} findings. OCR review pages: {failed_ocr}.")
+                if msg[0]=="status":
+                    self.status_var.set(msg[1])
+                elif msg[0]=="progress":
+                    _,stage,current,total=msg
+                    total=max(1,total)
+                    current=max(0,min(current,total))
+                    pct=min(100.0,(current/total)*100.0)
+                    self.progress["maximum"]=100
+                    self.progress["value"]=pct
+                    self.progress_var.set(f"{pct:5.1f}%")
+                    self.status_var.set(f"{stage.replace('_',' ').title()}: {current}/{total}")
+                elif msg[0]=="scan_done":
+                    _,self.findings,self.page_modes=msg
+                    self._finish_operation();self.progress["value"]=100;self.progress_var.set("100%")
+                    self._refresh_tree();failed_ocr=sum(1 for m in self.page_modes.values() if m=="ocr_failed");self.status_var.set(f"Scan complete: {len(self.findings)} findings. OCR review pages: {failed_ocr}.")
                 elif msg[0]=="export_done":
+                    self._finish_operation();self.progress["value"]=100;self.progress_var.set("100%")
                     result=msg[1];review=result["audit"]["pages_requiring_review"];doc_review=result["audit"].get("document_review_required",False)
                     if review or doc_review:self.status_var.set(f"Export created; review required. Page flags: {len(review)}. See audit manifest.");messagebox.showwarning("Review required",f"Export created, but automated verification did not receive a clean document-level PASS.\n\nPage flags: {len(review)}\nPDF: {result['output_path']}\nAudit: {result['audit_path']}")
                     else:self.status_var.set("Verified export complete. Final visual review is still required.");messagebox.showinfo("Export complete",f"All processed pages passed automated verification.\n\nPDF: {result['output_path']}\nAudit: {result['audit_path']}\n\nPerform a final visual review before release.")
-                elif msg[0]=="error":self.status_var.set(msg[1]);messagebox.showerror("PII Scrubber",msg[1])
+                elif msg[0]=="error":
+                    self._finish_operation();self.status_var.set(msg[1]);messagebox.showerror("PII Scrubber",msg[1])
         except queue.Empty:pass
         self.after(100,self._poll)
 
