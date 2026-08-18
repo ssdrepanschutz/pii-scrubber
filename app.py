@@ -143,12 +143,12 @@ class PIIScrubberApp(tk.Tk):
         return ExportOptions(**kwargs)
 
     def _apply_ssd_medical_policy(self):
-        # Default: scrub detected personal identifiers.
-        # Preserve ordinary public URLs automatically; they are not claimant PII.
+        # Scrub claimant/patient identifiers by default.
+        # Preserve provider names and ordinary public URLs because they are not claimant PII.
+        preserve_categories = {"URL", "PROVIDER NAME"}
         for f in self.findings:
-            f.selected = True
-            if str(f.category).upper() == "URL":
-                f.selected = False
+            category = str(f.category).strip().upper()
+            f.selected = category not in preserve_categories
         dedupe_entity_replacements(self.findings)
 
     def checkpoint_path(self):
