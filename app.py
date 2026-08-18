@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import queue
 import threading
@@ -61,37 +62,89 @@ class PIIScrubberApp(tk.Tk):
             self.ocr_var.set(True)
             if hasattr(self, "status_var"): self.status_var.set("Fast OCR-PDF Mode: existing searchable text first; OCR only when needed; 250-page chunks.")
 
+    def _scan_options(self, custom):
+        kwargs = dict(
+            chunk_size=self.chunk_var.get(),
+            selective_ocr=self.ocr_var.get(),
+            detect_names=self.names_var.get(),
+            detect_addresses=self.addr_var.get(),
+            custom_terms=custom,
+        )
+        if "fast_ocr_pdf" in inspect.signature(ScanOptions).parameters:
+            kwargs["fast_ocr_pdf"] = self.fast_var.get()
+        return ScanOptions(**kwargs)
+
+    def _export_options(self):
+        kwargs = dict(
+            chunk_size=self.chunk_var.get(),
+            mode=self.mode_var.get(),
+            sanitize=True,
+            selective_rasterize_on_failure=self.raster_var.get(),
+            restore_search_on_rasterized_pages=self.search_var.get(),
+        )
+        if "fast_ocr_pdf" in inspect.signature(ExportOptions).parameters:
+            kwargs["fast_ocr_pdf"] = self.fast_var.get()
+        return ExportOptions(**kwargs)
+
     def checkpoint_path(self):
         if not self.input_path:return ""
         p=Path(self.input_path); return str(p.parent/("."+p.name+".pii-v3.checkpoint"))
+
     def open_pdf(self):
         p=filedialog.askopenfilename(filetypes=[("PDF files","*.pdf")])
         if p:self.input_path=p;self.path_var.set(p);self.findings=[];self.page_modes={};self._refresh_tree();self.status_var.set("PDF loaded. Scan when ready.")
+
     def _progress_cb(self,stage,current,total):self.q.put(("progress",stage,current,total))
+
     def scan(self):
-        p=self.path_var.get().strip()
-        if not p or not os.path.exists(p):messagebox.showerror("PII Scrubber","Choose a PDF first.");return
-        self.input_path=p; custom=[x.strip() for x in self.custom_var.get().split(";") if x.strip()]; opts=ScanOptions(chunk_size=self.chunk_var.get(),selective_ocr=self.ocr_var.get(),detect_names=self.names_var.get(),detect_addresses=self.addr_var.get(),custom_terms=custom,fast_ocr_pdf=self.fast_var.get());self.status_var.set("Fast scanning existing OCR text..." if self.fast_var.get() else "Scanning...");threading.Thread(target=self._scan_worker,args=(opts,),daemon=True).start()
+        try:
+            p=self.path_var.get().strip()
+            if not p or not os.path.exists(p):
+                messagebox.showerror("PII Scrubber","Choose a PDF first.")
+                return
+            if not p.lower().endswith(".pdf"):
+                messagebox.showerror("PII Scrubber","The selected file is not a PDF.")
+                return
+            self.input_path=p
+            custom=[x.strip() for x in self.custom_var.get().split(";") if x.strip()]
+            opts=self._scan_options(custom)
+            self.progress["value"]=0
+            self.status_var.set("Starting scan...")
+            self.update_idletasks()
+            threading.Thread(target=self._scan_worker,args=(opts,),daemon=True).start()
+        except Exception as e:
+            self.status_var.set("Scan could not start.")
+            messagebox.showerror("PII Scrubber - Scan Error",f"The scan could not start.\n\n{type(e).__name__}: {e}")
+
     def _scan_worker(self,opts):
-        try:self.q.put(("scan_done",*scan_document(self.input_path,opts,self.checkpoint_path(),self._progress_cb)))
-        except Exception as e:self.q.put(("error",f"Scan failed: {e}"))
+        try:
+            self.q.put(("status","Fast scanning existing OCR text..." if self.fast_var.get() else "Scanning..."))
+            self.q.put(("scan_done",*scan_document(self.input_path,opts,self.checkpoint_path(),self._progress_cb)))
+        except Exception as e:
+            self.q.put(("error",f"Scan failed: {type(e).__name__}: {e}"))
+
     def _refresh_tree(self):
         for i in self.tree.get_children():self.tree.delete(i)
         for idx,f in enumerate(self.findings):
             display=f.value if f.category!="SSN" else "***-**-"+"".join(ch for ch in f.value if ch.isdigit())[-4:];self.tree.insert("","end",iid=str(idx),values=("Yes" if f.selected else "No",f.page,f.category,f.source,f"{f.confidence:.2f}",f.replacement,display))
+
     def set_all(self,flag):
         for f in self.findings:f.selected=flag
         self._refresh_tree()
+
     def toggle_selected(self,event=None):
         sel=self.tree.selection()
         if not sel:return
         idx=int(sel[0]);self.findings[idx].selected=not self.findings[idx].selected;self._refresh_tree();self.tree.selection_set(str(idx))
+
     def assign_tokens(self):dedupe_entity_replacements(self.findings);self._refresh_tree();self.status_var.set("Stable provider/person tokens assigned. Claimant remains [CLAIMANT].")
+
     def apply_replacement(self):
         sel=self.tree.selection()
         if not sel:return
         idx=int(sel[0]);repl=self.repl_var.get().strip()
         if repl:self.findings[idx].replacement=repl;self._refresh_tree();self.tree.selection_set(str(idx))
+
     def on_select(self,event=None):
         sel=self.tree.selection()
         if not sel or not self.input_path:return
@@ -99,20 +152,34 @@ class PIIScrubberApp(tk.Tk):
         try:
             data=preview_page(self.input_path,f.page,self.findings);im=Image.open(BytesIO(data));im.thumbnail((max(300,self.canvas.winfo_width()-20),max(300,self.canvas.winfo_height()-20)));self.preview_img=ImageTk.PhotoImage(im);self.canvas.delete("all");self.canvas.create_image(10,10,image=self.preview_img,anchor="nw")
         except Exception as e:self.status_var.set(f"Preview unavailable: {e}")
+
     def export(self):
-        if not self.input_path or not self.findings:messagebox.showerror("PII Scrubber","Scan and review the PDF first.");return
-        suggested=suggest_output_path(self.input_path);out=filedialog.asksaveasfilename(defaultextension=".pdf",initialfile=Path(suggested).name,filetypes=[("PDF files","*.pdf")])
-        if not out:return
-        if os.path.abspath(out)==os.path.abspath(self.input_path):messagebox.showerror("PII Scrubber","The scrubbed file cannot overwrite the original.");return
-        opts=ExportOptions(chunk_size=self.chunk_var.get(),mode=self.mode_var.get(),sanitize=True,selective_rasterize_on_failure=self.raster_var.get(),restore_search_on_rasterized_pages=self.search_var.get(),fast_ocr_pdf=self.fast_var.get());self.status_var.set("Fast scrub + verify..." if self.fast_var.get() else "Scrubbing, sanitizing, and independently verifying...");threading.Thread(target=self._export_worker,args=(out,opts),daemon=True).start()
+        try:
+            if not self.input_path or not self.findings:
+                messagebox.showerror("PII Scrubber","Scan and review the PDF first.")
+                return
+            suggested=suggest_output_path(self.input_path);out=filedialog.asksaveasfilename(defaultextension=".pdf",initialfile=Path(suggested).name,filetypes=[("PDF files","*.pdf")])
+            if not out:return
+            if os.path.abspath(out)==os.path.abspath(self.input_path):
+                messagebox.showerror("PII Scrubber","The scrubbed file cannot overwrite the original.")
+                return
+            opts=self._export_options()
+            self.status_var.set("Fast scrub + verify..." if self.fast_var.get() else "Scrubbing, sanitizing, and independently verifying...")
+            threading.Thread(target=self._export_worker,args=(out,opts),daemon=True).start()
+        except Exception as e:
+            self.status_var.set("Export could not start.")
+            messagebox.showerror("PII Scrubber - Export Error",f"The export could not start.\n\n{type(e).__name__}: {e}")
+
     def _export_worker(self,out,opts):
         try:self.q.put(("export_done",export_sanitized(self.input_path,out,self.findings,self.page_modes,opts,self._progress_cb)))
-        except Exception as e:self.q.put(("error",f"Export failed: {e}"))
+        except Exception as e:self.q.put(("error",f"Export failed: {type(e).__name__}: {e}"))
+
     def _poll(self):
         try:
             while True:
                 msg=self.q.get_nowait()
-                if msg[0]=="progress":_,stage,current,total=msg;self.progress["maximum"]=max(1,total);self.progress["value"]=current;self.status_var.set(f"{stage.replace('_',' ').title()}: {current}/{total}")
+                if msg[0]=="status":self.status_var.set(msg[1])
+                elif msg[0]=="progress":_,stage,current,total=msg;self.progress["maximum"]=max(1,total);self.progress["value"]=current;self.status_var.set(f"{stage.replace('_',' ').title()}: {current}/{total}")
                 elif msg[0]=="scan_done":_,self.findings,self.page_modes=msg;self._refresh_tree();failed_ocr=sum(1 for m in self.page_modes.values() if m=="ocr_failed");self.status_var.set(f"Scan complete: {len(self.findings)} findings. OCR review pages: {failed_ocr}.")
                 elif msg[0]=="export_done":
                     result=msg[1];review=result["audit"]["pages_requiring_review"];doc_review=result["audit"].get("document_review_required",False)
