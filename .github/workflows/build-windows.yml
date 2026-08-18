@@ -1,0 +1,89 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'engine.py.gz.b64'
+      - 'requirements.txt'
+      - 'installer/**'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Restore V3 engine source
+        shell: pwsh
+        run: |
+          $b64 = Get-Content engine.py.gz.b64 -Raw
+          $bytes = [Convert]::FromBase64String($b64)
+          [IO.File]::WriteAllBytes('engine.py.gz', $bytes)
+          $in = [IO.File]::OpenRead('engine.py.gz')
+          $gz = New-Object IO.Compression.GzipStream($in, [IO.Compression.CompressionMode]::Decompress)
+          $out = [IO.File]::Create('engine.py')
+          $gz.CopyTo($out)
+          $out.Dispose(); $gz.Dispose(); $in.Dispose()
+
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install local OCR runtime
+        shell: pwsh
+        run: |
+          choco install tesseract --yes --no-progress
+          $src = 'C:\Program Files\Tesseract-OCR'
+          if (!(Test-Path "$src\tessdata\eng.traineddata")) { throw 'Tesseract English OCR data was not installed.' }
+          New-Item -ItemType Directory -Force -Path bundled-ocr | Out-Null
+          Copy-Item "$src\tessdata" bundled-ocr\tessdata -Recurse
+
+      - name: Validate source
+        run: |
+          python -m py_compile app.py engine.py
+          python -c "import engine; print('PII Scrubber engine', engine.APP_VERSION)"
+
+      - name: Build desktop application
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name PII-Scrubber-v3 --collect-all fitz --collect-all cryptography --add-data "bundled-ocr\tessdata;Tesseract-OCR\tessdata" app.py
+
+      - name: Verify packaged OCR data
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'dist\PII-Scrubber-v3\Tesseract-OCR\tessdata\eng.traineddata')) { throw 'Bundled OCR data missing from application.' }
+          if (!(Test-Path 'dist\PII-Scrubber-v3\PII-Scrubber-v3.exe')) { throw 'Application executable missing.' }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'installer\PII-Scrubber.iss'
+          if (!(Test-Path 'installer-output\PII-Scrubber-Setup.exe')) { throw 'Installer was not created.' }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PII-Scrubber-Windows-Installer
+          path: installer-output/PII-Scrubber-Setup.exe
+          if-no-files-found: error
+          retention-days: 30
