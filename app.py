@@ -32,15 +32,17 @@ class PIIScrubberApp(tk.Tk):
 
     def _build(self):
         top = ttk.Frame(self, padding=10); top.pack(fill="x")
-        ttk.Label(top, text="Local PII Scrubber v3", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text=f"Local PII Scrubber v{APP_VERSION}", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(top, text="Large-file mode: chunked scan, selective OCR, sanitization, verification, selective rasterization.").grid(row=1, column=0, columnspan=7, sticky="w", pady=(2, 8))
         self.path_var = tk.StringVar(); ttk.Entry(top, textvariable=self.path_var).grid(row=2, column=0, columnspan=5, sticky="ew", padx=(0, 6))
         ttk.Button(top, text="Open PDF", command=self.open_pdf).grid(row=2, column=5, padx=3); ttk.Button(top, text="Scan / Resume", command=self.scan).grid(row=2, column=6, padx=3); top.columnconfigure(0, weight=1)
         opts = ttk.Frame(top); opts.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(8, 0))
-        self.chunk_var=tk.IntVar(value=100); self.ocr_var=tk.BooleanVar(value=True); self.names_var=tk.BooleanVar(value=True); self.addr_var=tk.BooleanVar(value=True); self.custom_var=tk.StringVar()
+        self.chunk_var=tk.IntVar(value=100); self.ocr_var=tk.BooleanVar(value=True); self.names_var=tk.BooleanVar(value=True); self.addr_var=tk.BooleanVar(value=True); self.custom_var=tk.StringVar(); self.fast_var=tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts,text="Fast OCR-PDF Mode",variable=self.fast_var,command=self._fast_mode_changed).pack(side="left",padx=(0,12))
         ttk.Label(opts,text="Chunk pages:").pack(side="left"); ttk.Spinbox(opts,from_=25,to=500,increment=25,width=6,textvariable=self.chunk_var).pack(side="left",padx=(4,12))
         ttk.Checkbutton(opts,text="Selective OCR",variable=self.ocr_var).pack(side="left",padx=4); ttk.Checkbutton(opts,text="Detect names",variable=self.names_var).pack(side="left",padx=4); ttk.Checkbutton(opts,text="Detect addresses",variable=self.addr_var).pack(side="left",padx=4)
         ttk.Label(opts,text="Custom terms:").pack(side="left",padx=(12,4)); ttk.Entry(opts,textvariable=self.custom_var,width=38).pack(side="left",fill="x",expand=True)
+        self._fast_mode_changed()
         body=ttk.Panedwindow(self,orient="horizontal"); body.pack(fill="both",expand=True,padx=10,pady=6); left=ttk.Frame(body); right=ttk.Frame(body); body.add(left,weight=3); body.add(right,weight=2)
         cols=("use","page","category","source","confidence","replacement","value"); self.tree=ttk.Treeview(left,columns=cols,show="headings",selectmode="browse")
         labels={"use":"Use","page":"Page","category":"Category","source":"Source","confidence":"Conf.","replacement":"Replacement","value":"Detected value"}; widths={"use":44,"page":58,"category":120,"source":65,"confidence":58,"replacement":135,"value":260}
@@ -53,6 +55,12 @@ class PIIScrubberApp(tk.Tk):
         ttk.Radiobutton(export,text="Replacement tokens",variable=self.mode_var,value="tokens").pack(side="left"); ttk.Radiobutton(export,text="Black redaction",variable=self.mode_var,value="black").pack(side="left",padx=(4,12)); ttk.Checkbutton(export,text="Rasterize only failed pages",variable=self.raster_var).pack(side="left",padx=4); ttk.Checkbutton(export,text="Restore search on rasterized pages",variable=self.search_var).pack(side="left",padx=4); ttk.Button(export,text="Scrub + Verify + Export",command=self.export).pack(side="right")
         status=ttk.Frame(self,padding=(10,0,10,10)); status.pack(fill="x"); self.progress=ttk.Progressbar(status,mode="determinate"); self.progress.pack(fill="x"); self.status_var=tk.StringVar(value="Ready"); ttk.Label(status,textvariable=self.status_var).pack(anchor="w",pady=(3,0))
 
+    def _fast_mode_changed(self):
+        if self.fast_var.get():
+            self.chunk_var.set(250)
+            self.ocr_var.set(True)
+            if hasattr(self, "status_var"): self.status_var.set("Fast OCR-PDF Mode: existing searchable text first; OCR only when needed; 250-page chunks.")
+
     def checkpoint_path(self):
         if not self.input_path:return ""
         p=Path(self.input_path); return str(p.parent/("."+p.name+".pii-v3.checkpoint"))
@@ -63,7 +71,7 @@ class PIIScrubberApp(tk.Tk):
     def scan(self):
         p=self.path_var.get().strip()
         if not p or not os.path.exists(p):messagebox.showerror("PII Scrubber","Choose a PDF first.");return
-        self.input_path=p; custom=[x.strip() for x in self.custom_var.get().split(";") if x.strip()]; opts=ScanOptions(chunk_size=self.chunk_var.get(),selective_ocr=self.ocr_var.get(),detect_names=self.names_var.get(),detect_addresses=self.addr_var.get(),custom_terms=custom);self.status_var.set("Scanning...");threading.Thread(target=self._scan_worker,args=(opts,),daemon=True).start()
+        self.input_path=p; custom=[x.strip() for x in self.custom_var.get().split(";") if x.strip()]; opts=ScanOptions(chunk_size=self.chunk_var.get(),selective_ocr=self.ocr_var.get(),detect_names=self.names_var.get(),detect_addresses=self.addr_var.get(),custom_terms=custom,fast_ocr_pdf=self.fast_var.get());self.status_var.set("Fast scanning existing OCR text..." if self.fast_var.get() else "Scanning...");threading.Thread(target=self._scan_worker,args=(opts,),daemon=True).start()
     def _scan_worker(self,opts):
         try:self.q.put(("scan_done",*scan_document(self.input_path,opts,self.checkpoint_path(),self._progress_cb)))
         except Exception as e:self.q.put(("error",f"Scan failed: {e}"))
@@ -96,7 +104,7 @@ class PIIScrubberApp(tk.Tk):
         suggested=suggest_output_path(self.input_path);out=filedialog.asksaveasfilename(defaultextension=".pdf",initialfile=Path(suggested).name,filetypes=[("PDF files","*.pdf")])
         if not out:return
         if os.path.abspath(out)==os.path.abspath(self.input_path):messagebox.showerror("PII Scrubber","The scrubbed file cannot overwrite the original.");return
-        opts=ExportOptions(chunk_size=self.chunk_var.get(),mode=self.mode_var.get(),sanitize=True,selective_rasterize_on_failure=self.raster_var.get(),restore_search_on_rasterized_pages=self.search_var.get());self.status_var.set("Scrubbing, sanitizing, and independently verifying...");threading.Thread(target=self._export_worker,args=(out,opts),daemon=True).start()
+        opts=ExportOptions(chunk_size=self.chunk_var.get(),mode=self.mode_var.get(),sanitize=True,selective_rasterize_on_failure=self.raster_var.get(),restore_search_on_rasterized_pages=self.search_var.get(),fast_ocr_pdf=self.fast_var.get());self.status_var.set("Fast scrub + verify..." if self.fast_var.get() else "Scrubbing, sanitizing, and independently verifying...");threading.Thread(target=self._export_worker,args=(out,opts),daemon=True).start()
     def _export_worker(self,out,opts):
         try:self.q.put(("export_done",export_sanitized(self.input_path,out,self.findings,self.page_modes,opts,self._progress_cb)))
         except Exception as e:self.q.put(("error",f"Export failed: {e}"))
