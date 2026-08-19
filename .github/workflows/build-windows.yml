@@ -1,12 +1,12 @@
 name: Build Windows Installer
 
-# Regenerated installer build 2026-08-18
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
       - 'app.py'
+      - 'app_v401.py'
       - 'engine.py.gz.b64'
       - 'requirements.txt'
       - 'installer/**'
@@ -61,35 +61,27 @@ jobs:
             if ($found) { $src = Split-Path (Split-Path $found.FullName -Parent) -Parent }
           }
           if (!$src) { throw 'Tesseract English OCR data was not installed or could not be located.' }
-          Write-Host "Using Tesseract OCR data from: $src"
           New-Item -ItemType Directory -Force -Path bundled-ocr | Out-Null
           Copy-Item (Join-Path $src 'tessdata') 'bundled-ocr\tessdata' -Recurse -Force
           if (!(Test-Path 'bundled-ocr\tessdata\eng.traineddata')) { throw 'OCR data copy failed.' }
 
       - name: Validate source
         run: |
-          python -m py_compile app.py engine.py
-          python -c "import engine; print('PII Scrubber engine', engine.APP_VERSION)"
+          python -m py_compile app.py app_v401.py
 
       - name: Build desktop application
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onedir --contents-directory . --name PII-Scrubber-v3 --collect-all fitz --collect-all cryptography --add-data "bundled-ocr\tessdata;Tesseract-OCR\tessdata" app.py
+          pyinstaller --noconfirm --clean --windowed --onedir --contents-directory . --name PII-Scrubber-v4 --collect-all fitz --collect-all cryptography --add-data "bundled-ocr\tessdata;Tesseract-OCR\tessdata" app_v401.py
 
       - name: Verify packaged OCR data
         shell: pwsh
         run: |
-          $app = 'dist\PII-Scrubber-v3\PII-Scrubber-v3.exe'
-          $rootOcr = 'dist\PII-Scrubber-v3\Tesseract-OCR\tessdata\eng.traineddata'
-          $internalOcr = 'dist\PII-Scrubber-v3\_internal\Tesseract-OCR\tessdata\eng.traineddata'
+          $app = 'dist\PII-Scrubber-v4\PII-Scrubber-v4.exe'
+          $rootOcr = 'dist\PII-Scrubber-v4\Tesseract-OCR\tessdata\eng.traineddata'
+          $internalOcr = 'dist\PII-Scrubber-v4\_internal\Tesseract-OCR\tessdata\eng.traineddata'
           if (!(Test-Path $app)) { throw 'Application executable missing.' }
-          if (!(Test-Path $rootOcr) -and !(Test-Path $internalOcr)) {
-            Write-Host 'Packaged application contents:'
-            Get-ChildItem 'dist\PII-Scrubber-v3' -Recurse | Select-Object -ExpandProperty FullName
-            throw 'Bundled OCR data missing from application.'
-          }
-          if (Test-Path $rootOcr) { Write-Host "Bundled OCR verified: $rootOcr" }
-          if (Test-Path $internalOcr) { Write-Host "Bundled OCR verified: $internalOcr" }
+          if (!(Test-Path $rootOcr) -and !(Test-Path $internalOcr)) { throw 'Bundled OCR data missing from application.' }
 
       - name: Install Inno Setup
         shell: pwsh
