@@ -1,6 +1,6 @@
 #define MyAppName "PII Scrubber"
-#define MyAppVersion "4.0.0"
-#define MyAppExeName "PII-Scrubber-v3.exe"
+#define MyAppVersion "4.0.1"
+#define MyAppExeName "PII-Scrubber-v4.exe"
 
 [Setup]
 AppId={{E99B9E0A-823B-4BCE-A5C2-3BB0416D3975}
@@ -19,7 +19,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 
 [Files]
-Source: "..\dist\PII-Scrubber-v3\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\PII-Scrubber-v4\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\PII Scrubber"; Filename: "{app}\{#MyAppExeName}"
