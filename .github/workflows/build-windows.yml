@@ -1,5 +1,6 @@
 name: Build Windows Installer
 
+# Regenerated installer build 2026-08-18
 on:
   workflow_dispatch:
   push:
