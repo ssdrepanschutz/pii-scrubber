@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import tkinter as tk
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -15,26 +16,22 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 from engine import (
-    APP_VERSION,
+    APP_VERSION as ENGINE_VERSION,
     ExportOptions,
     ScanOptions,
     dedupe_entity_replacements,
     export_sanitized,
     preview_page,
     scan_document,
-    suggest_output_path,
 )
 
 
-class PIIScrubberApp(tk.Tk):
-    """Fast claimant-identity scrubber for SSD/medical PDFs.
+UI_BUILD = "3.2.1"
+POLICY_VERSION = "claimant-only-v3"
 
-    Deliberately narrow policy:
-    - scrub claimant name variants, claimant surname occurrences, claimant DOB,
-      claimant SSN, claimant home address, and document metadata;
-    - preserve MRNs, provider names, provider/lab/facility addresses, treatment
-      dates, URLs, and unrelated medical-record content.
-    """
+
+class PIIScrubberApp(tk.Tk):
+    """Fast, narrow claimant-PII scrubber for SSD/medical PDFs."""
 
     SCRUB_CATEGORIES = {
         "SSN",
@@ -42,14 +39,17 @@ class PIIScrubberApp(tk.Tk):
         "DOB",
         "DATE OF BIRTH",
         "BIRTH DATE",
-        "CLAIMANT NAME",
-        "PATIENT NAME",
     }
 
     NEVER_SCRUB_CATEGORIES = {
         "MRN",
+        "MRN/ACCOUNT",
+        "MRN / ACCOUNT",
         "MEDICAL RECORD NUMBER",
         "MEDICAL RECORD #",
+        "ACCOUNT",
+        "ACCOUNT NUMBER",
+        "PATIENT ID",
         "URL",
         "PROVIDER NAME",
         "PHONE",
@@ -59,9 +59,29 @@ class PIIScrubberApp(tk.Tk):
         "ZIP",
     }
 
+    GENERIC_NAME_LABELS = {
+        "patient",
+        "patient name",
+        "claimant",
+        "claimant name",
+        "member",
+        "member name",
+        "beneficiary",
+        "beneficiary name",
+        "applicant",
+        "applicant name",
+        "insured",
+        "insured name",
+        "name",
+    }
+
+    NAME_CATEGORIES = {"CLAIMANT NAME", "PATIENT NAME"}
+    NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+    PROVIDER_CREDENTIALS = {"md", "do", "np", "pa", "rn", "phd", "lcsw", "psyd", "dpm"}
+
     def __init__(self):
         super().__init__()
-        self.title(f"Local PII Scrubber v{APP_VERSION}")
+        self.title(f"Local PII Scrubber {UI_BUILD}")
         self.geometry("1320x820")
         self.minsize(1100, 700)
         self.input_path = ""
@@ -73,6 +93,7 @@ class PIIScrubberApp(tk.Tk):
         self.operation_active = False
         self.identity_values = set()
         self.claimant_addresses = set()
+        self.accepted_claimant_names = set()
         self._build()
         self.after(100, self._poll)
         self.after(500, self._tick_elapsed)
@@ -82,14 +103,14 @@ class PIIScrubberApp(tk.Tk):
         top.pack(fill="x")
         ttk.Label(
             top,
-            text=f"Local PII Scrubber v{APP_VERSION}",
+            text=f"Local PII Scrubber {UI_BUILD}",
             font=("Segoe UI", 18, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             top,
             text=(
-                "Fast Claimant PII Mode — scrubs claimant identity + metadata only; "
-                "MRNs, providers, labs, treatment dates, and unrelated addresses are preserved."
+                f"Claimant PII Only — build {UI_BUILD} / engine {ENGINE_VERSION}. "
+                "Scrubs claimant identity + metadata; preserves unrelated medical-record content."
             ),
         ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(2, 8))
 
@@ -106,7 +127,10 @@ class PIIScrubberApp(tk.Tk):
         ttk.Label(policy, text="Policy: Claimant PII Only", font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Label(
             policy,
-            text="  •  existing OCR first  •  selective OCR fallback  •  metadata sanitized  •  no broad de-identification",
+            text=(
+                "  •  SSN / DOB  •  claimant name + first name + surname  •  claimant home address  "
+                "•  metadata  •  everything else preserved"
+            ),
         ).pack(side="left")
 
         body = ttk.Panedwindow(self, orient="horizontal")
@@ -124,7 +148,7 @@ class PIIScrubberApp(tk.Tk):
             "source": "Source",
             "confidence": "Conf.",
             "action": "Automatic action",
-            "value": "Detected value",
+            "value": "PII to remove",
         }
         widths = {
             "page": 58,
@@ -151,7 +175,7 @@ class PIIScrubberApp(tk.Tk):
         export.pack(fill="x", padx=10, pady=(2, 6))
         ttk.Label(
             export,
-            text="Automatic: claimant identity is scrubbed; unrelated medical-record information is preserved.",
+            text="Only the claimant-PII findings shown above are sent to the scrub/export engine.",
         ).pack(side="left")
         ttk.Button(export, text="Scrub + Verify + Export", command=self.export).pack(side="right")
 
@@ -190,9 +214,8 @@ class PIIScrubberApp(tk.Tk):
         self.after(500, self._tick_elapsed)
 
     def _scan_options(self, custom_terms=None, identity_only=False):
-        # Large chunks reduce overhead on searchable 1,000+ page PDFs.
         kwargs = dict(
-            chunk_size=500,
+            chunk_size=500 if identity_only else 250,
             selective_ocr=not identity_only,
             detect_names=not identity_only,
             detect_addresses=not identity_only,
@@ -204,11 +227,11 @@ class PIIScrubberApp(tk.Tk):
 
     def _export_options(self):
         kwargs = dict(
-            chunk_size=500,
+            chunk_size=250,
             mode="tokens",
-            sanitize=True,  # removes PDF metadata/XMP and other supported hidden document data
+            sanitize=True,
             selective_rasterize_on_failure=True,
-            restore_search_on_rasterized_pages=False,  # fastest safe fallback; avoids a second OCR pass
+            restore_search_on_rasterized_pages=False,
         )
         if "fast_ocr_pdf" in inspect.signature(ExportOptions).parameters:
             kwargs["fast_ocr_pdf"] = True
@@ -217,6 +240,34 @@ class PIIScrubberApp(tk.Tk):
     @staticmethod
     def _normalize(value):
         return " ".join(str(value or "").strip().split())
+
+    @classmethod
+    def _clean_name(cls, value):
+        text = cls._normalize(value)
+        if not text:
+            return ""
+        text = re.sub(
+            r"^(?:patient|claimant|member|beneficiary|applicant|insured)\s*(?:name)?\s*[:#\-]?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return cls._normalize(text)
+
+    @classmethod
+    def _is_plausible_person_name(cls, value):
+        text = cls._clean_name(value)
+        if not text or text.casefold() in cls.GENERIC_NAME_LABELS:
+            return False
+        if any(ch.isdigit() for ch in text):
+            return False
+        tokens = re.findall(r"[A-Za-z][A-Za-z'\-.]*", text)
+        if len(tokens) < 2:
+            return False
+        lower_tokens = {t.strip(".").casefold() for t in tokens}
+        if lower_tokens & cls.PROVIDER_CREDENTIALS:
+            return False
+        return True
 
     @staticmethod
     def _rect_center(finding):
@@ -257,73 +308,137 @@ class PIIScrubberApp(tk.Tk):
             variants.add(re.sub(pattern, short, upper))
         return {PIIScrubberApp._normalize(v) for v in variants if len(PIIScrubberApp._normalize(v)) >= 6}
 
+    def _provider_name_values(self, findings):
+        return {
+            self._normalize(getattr(f, "value", "")).casefold()
+            for f in findings
+            if str(getattr(f, "category", "")).strip().upper() == "PROVIDER NAME"
+        }
+
     def _claimant_name_findings(self, findings):
-        return [
-            f
-            for f in findings
-            if str(getattr(f, "category", "")).strip().upper() in {"CLAIMANT NAME", "PATIENT NAME"}
-        ]
+        providers = self._provider_name_values(findings)
+        accepted = []
+        self.accepted_claimant_names = set()
+        for finding in findings:
+            category = str(getattr(finding, "category", "")).strip().upper()
+            if category not in self.NAME_CATEGORIES:
+                continue
+            cleaned = self._clean_name(getattr(finding, "value", ""))
+            if not self._is_plausible_person_name(cleaned):
+                continue
+            if cleaned.casefold() in providers:
+                continue
+            accepted.append(finding)
+            self.accepted_claimant_names.add(cleaned.casefold())
+        return accepted
 
-    def _claimant_address_values(self, findings):
-        """Choose only addresses spatially associated with a claimant/patient name.
+    def _nearby_dob_anchor(self, name_finding, findings):
+        ncenter = self._rect_center(name_finding)
+        if ncenter is None:
+            return False
+        for finding in findings:
+            if getattr(finding, "page", None) != getattr(name_finding, "page", None):
+                continue
+            category = str(getattr(finding, "category", "")).strip().upper()
+            if category not in {"DOB", "DATE OF BIRTH", "BIRTH DATE"}:
+                continue
+            center = self._rect_center(finding)
+            if center is not None and math.hypot(center[0] - ncenter[0], center[1] - ncenter[1]) <= 280:
+                return True
+        return False
 
-        Generic addresses are preserved. This prevents lab/provider/facility addresses
-        from being scrubbed merely because they are addresses.
-        """
-        names = self._claimant_name_findings(findings)
+    def _claimant_address_values(self, findings, claimant_names):
         addresses = [
-            f
-            for f in findings
+            f for f in findings
             if str(getattr(f, "category", "")).strip().upper() == "ADDRESS"
         ]
-        selected = set()
+        providers = [
+            f for f in findings
+            if str(getattr(f, "category", "")).strip().upper() == "PROVIDER NAME"
+        ]
+        candidates = []
 
-        for name in names:
-            same_page = [a for a in addresses if getattr(a, "page", None) == getattr(name, "page", None)]
-            if not same_page:
-                continue
+        for name in claimant_names:
             ncenter = self._rect_center(name)
             if ncenter is None:
-                # Without coordinates, do not guess. Preserving an unrelated address is safer
-                # than broadly removing every institutional address.
                 continue
-
-            ranked = []
-            for addr in same_page:
+            has_dob_anchor = self._nearby_dob_anchor(name, findings)
+            for addr in addresses:
+                if getattr(addr, "page", None) != getattr(name, "page", None):
+                    continue
                 acenter = self._rect_center(addr)
                 if acenter is None:
                     continue
-                distance = math.hypot(acenter[0] - ncenter[0], acenter[1] - ncenter[1])
-                # Claimant demographic/header blocks are normally close together.
-                if distance <= 260:
-                    ranked.append((distance, addr))
-            if ranked:
-                ranked.sort(key=lambda item: item[0])
-                selected.add(self._normalize(ranked[0][1].value))
 
-        return {v for v in selected if v}
+                dx = abs(acenter[0] - ncenter[0])
+                dy = acenter[1] - ncenter[1]
+                if dx > 140 or dy < -25 or dy > 185:
+                    continue
+
+                name_distance = math.hypot(acenter[0] - ncenter[0], acenter[1] - ncenter[1])
+                provider_closer = False
+                for provider in providers:
+                    if getattr(provider, "page", None) != getattr(addr, "page", None):
+                        continue
+                    pcenter = self._rect_center(provider)
+                    if pcenter is None:
+                        continue
+                    if math.hypot(acenter[0] - pcenter[0], acenter[1] - pcenter[1]) < name_distance:
+                        provider_closer = True
+                        break
+                if provider_closer:
+                    continue
+
+                candidates.append((self._normalize(addr.value), has_dob_anchor))
+
+        counts = Counter(value.casefold() for value, _ in candidates if value)
+        selected = set()
+        for value, has_dob_anchor in candidates:
+            if value and (has_dob_anchor or counts[value.casefold()] >= 2):
+                selected.add(value)
+        return selected
+
+    @classmethod
+    def _name_parts(cls, cleaned_name):
+        text = cls._clean_name(cleaned_name)
+        if not text:
+            return set()
+
+        if "," in text:
+            left, right = text.split(",", 1)
+            surname_tokens = re.findall(r"[A-Za-z][A-Za-z'\-.]*", left)
+            first_tokens = re.findall(r"[A-Za-z][A-Za-z'\-.]*", right)
+            surname = surname_tokens[-1] if surname_tokens else ""
+            first = first_tokens[0] if first_tokens else ""
+        else:
+            tokens = re.findall(r"[A-Za-z][A-Za-z'\-.]*", text)
+            while tokens and tokens[-1].strip(".").casefold() in cls.NAME_SUFFIXES:
+                tokens.pop()
+            first = tokens[0] if tokens else ""
+            surname = tokens[-1] if len(tokens) >= 2 else ""
+
+        return {part for part in (first, surname) if len(part.strip(".")) >= 2}
 
     def _identity_terms(self, findings):
         terms = set()
         claimant_names = self._claimant_name_findings(findings)
 
         for finding in claimant_names:
-            value = self._normalize(finding.value)
-            if not value:
+            cleaned = self._clean_name(getattr(finding, "value", ""))
+            if not cleaned:
                 continue
-            terms.add(value)
-            parts = [p for p in re.findall(r"[A-Za-z][A-Za-z'\-]+", value) if len(p) >= 2]
-            if parts:
-                # Full first name and surname are scrubbed everywhere. Surname matching also
-                # removes any other person who has the claimant's last name, per user policy.
-                terms.add(parts[0])
-                terms.add(parts[-1])
+            terms.add(cleaned)
+            terms.update(self._name_parts(cleaned))
 
-        self.claimant_addresses = self._claimant_address_values(findings)
+        self.claimant_addresses = self._claimant_address_values(findings, claimant_names)
         for address in self.claimant_addresses:
             terms.update(self._address_variants(address))
 
-        self.identity_values = {self._normalize(t).casefold() for t in terms if self._normalize(t)}
+        self.identity_values = {
+            self._normalize(term).casefold()
+            for term in terms
+            if self._normalize(term).casefold() not in self.GENERIC_NAME_LABELS
+        }
         return sorted(terms, key=len, reverse=True)
 
     @staticmethod
@@ -336,36 +451,40 @@ class PIIScrubberApp(tk.Tk):
         )
 
     def _apply_narrow_policy(self):
+        claimant_address_keys = {a.casefold() for a in self.claimant_addresses}
+
         for finding in self.findings:
             category = str(getattr(finding, "category", "")).strip().upper()
-            value_key = self._normalize(getattr(finding, "value", "")).casefold()
-
-            # Default is PRESERVE. Only explicitly required claimant PII is selected.
+            value = self._normalize(getattr(finding, "value", ""))
+            value_key = value.casefold()
             selected = False
 
-            if category in self.SCRUB_CATEGORIES:
-                selected = True
-            elif category in self.NEVER_SCRUB_CATEGORIES:
+            # Explicit preserve rules win. MRNs and other non-target identifiers never
+            # reach the export engine even if the detector found them.
+            if category in self.NEVER_SCRUB_CATEGORIES:
                 selected = False
+            elif value_key in self.GENERIC_NAME_LABELS:
+                selected = False
+            elif category in self.SCRUB_CATEGORIES:
+                selected = True
             elif category == "ADDRESS":
-                selected = value_key in {a.casefold() for a in self.claimant_addresses}
+                selected = value_key in claimant_address_keys
             elif value_key and value_key in self.identity_values:
-                # Findings from the exact claimant-identity pass (first name, surname,
-                # full name, claimant-address variants) are scrubbed regardless of the
-                # engine's generic category label.
                 selected = True
 
             finding.selected = selected
 
-        dedupe_entity_replacements(self.findings)
+        scrub_findings = [f for f in self.findings if f.selected]
+        dedupe_entity_replacements(scrub_findings)
+
+    def _scrub_findings(self):
+        return [f for f in self.findings if getattr(f, "selected", False)]
 
     def checkpoint_path(self, suffix=""):
         if not self.input_path:
             return ""
         p = Path(self.input_path)
-        # New policy gets its own checkpoint namespace so stale broad-policy results
-        # cannot be resumed into this build.
-        return str(p.parent / ("." + p.name + f".pii-claimant-only-v1{suffix}.checkpoint"))
+        return str(p.parent / ("." + p.name + f".{POLICY_VERSION}{suffix}.checkpoint"))
 
     def open_pdf(self):
         p = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -376,6 +495,7 @@ class PIIScrubberApp(tk.Tk):
             self.page_modes = {}
             self.identity_values = set()
             self.claimant_addresses = set()
+            self.accepted_claimant_names = set()
             self._refresh_tree()
             self.status_var.set("PDF loaded. Click Scan.")
 
@@ -440,12 +560,16 @@ class PIIScrubberApp(tk.Tk):
     def _refresh_tree(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+
+        # Do not load preserved MRNs, provider names, URLs, lab addresses, etc. into
+        # the interface. There is nothing for the user to decide about them.
         for idx, finding in enumerate(self.findings):
+            if not getattr(finding, "selected", False):
+                continue
             value = str(finding.value)
             if str(finding.category).strip().upper() == "SSN":
                 digits = "".join(ch for ch in value if ch.isdigit())
                 value = "***-**-" + digits[-4:]
-            action = "SCRUB" if finding.selected else "PRESERVE"
             self.tree.insert(
                 "",
                 "end",
@@ -455,7 +579,7 @@ class PIIScrubberApp(tk.Tk):
                     finding.category,
                     finding.source,
                     f"{finding.confidence:.2f}",
-                    action,
+                    "SCRUB",
                     value,
                 ),
             )
@@ -466,7 +590,7 @@ class PIIScrubberApp(tk.Tk):
             return
         finding = self.findings[int(selection[0])]
         try:
-            data = preview_page(self.input_path, finding.page, self.findings)
+            data = preview_page(self.input_path, finding.page, self._scrub_findings())
             image = Image.open(BytesIO(data))
             image.thumbnail(
                 (
@@ -482,14 +606,14 @@ class PIIScrubberApp(tk.Tk):
 
     def export(self):
         try:
-            if not self.input_path or not self.findings:
-                messagebox.showerror("PII Scrubber", "Scan the PDF first.")
+            scrub_findings = self._scrub_findings()
+            if not self.input_path or not scrub_findings:
+                messagebox.showerror("PII Scrubber", "Scan the PDF first. No claimant PII findings are currently selected for removal.")
                 return
 
-            suggested = suggest_output_path(self.input_path)
             output_path = filedialog.asksaveasfilename(
                 defaultextension=".pdf",
-                initialfile=Path(suggested).name,
+                initialfile="PII-Scrubbed.pdf",
                 filetypes=[("PDF files", "*.pdf")],
             )
             if not output_path:
@@ -501,7 +625,7 @@ class PIIScrubberApp(tk.Tk):
             self._start_operation("Scrubbing claimant PII, sanitizing metadata, and verifying...")
             threading.Thread(
                 target=self._export_worker,
-                args=(output_path, self._export_options()),
+                args=(output_path, scrub_findings, self._export_options()),
                 daemon=True,
             ).start()
         except Exception as exc:
@@ -512,12 +636,12 @@ class PIIScrubberApp(tk.Tk):
                 f"The export could not start.\n\n{type(exc).__name__}: {exc}",
             )
 
-    def _export_worker(self, output_path, options):
+    def _export_worker(self, output_path, scrub_findings, options):
         try:
             result = export_sanitized(
                 self.input_path,
                 output_path,
-                self.findings,
+                scrub_findings,
                 self.page_modes,
                 options,
                 self._progress_cb,
@@ -538,7 +662,6 @@ class PIIScrubberApp(tk.Tk):
                     _, stage, current, total = msg
                     total = max(1, total)
                     current = max(0, min(current, total))
-                    # Reserve the final 12% for the lightweight identity check.
                     pct = min(88.0, (current / total) * 88.0)
                     self.progress["value"] = pct
                     self.progress_var.set(f"{pct:5.1f}%")
@@ -557,12 +680,12 @@ class PIIScrubberApp(tk.Tk):
                     self.progress["value"] = 100
                     self.progress_var.set("100%")
                     self._refresh_tree()
-                    scrub_count = sum(1 for f in self.findings if f.selected)
-                    preserve_count = len(self.findings) - scrub_count
+                    scrub_count = len(self._scrub_findings())
+                    ignored_count = len(self.findings) - scrub_count
                     failed_ocr = sum(1 for mode in self.page_modes.values() if mode == "ocr_failed")
                     self.status_var.set(
-                        f"Scan complete: {scrub_count} claimant-PII findings to scrub; "
-                        f"{preserve_count} other findings preserved. OCR review pages: {failed_ocr}."
+                        f"Scan complete: {scrub_count} claimant-PII findings to remove; "
+                        f"{ignored_count} non-target findings ignored. OCR review pages: {failed_ocr}."
                     )
 
                 elif msg[0] == "export_done":
