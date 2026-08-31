@@ -1,5 +1,5 @@
 #define MyAppName "PII Scrubber"
-#define MyAppVersion "4.0.1"
+#define MyAppVersion "4.0.2"
 #define MyAppExeName "PII-Scrubber-v4.exe"
 
 [Setup]
