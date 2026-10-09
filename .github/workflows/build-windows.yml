@@ -99,4 +99,4 @@ jobs:
           name: PII-Scrubber-Windows-Installer
           path: installer-output/PII-Scrubber-Setup.exe
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
